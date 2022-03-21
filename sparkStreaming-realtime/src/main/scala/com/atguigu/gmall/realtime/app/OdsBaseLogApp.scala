@@ -2,11 +2,13 @@ package com.atguigu.gmall.realtime.app
 
 import com.alibaba.fastjson.serializer.SerializeConfig
 import com.alibaba.fastjson.{JSON, JSONArray, JSONObject}
-import com.atguigu.gmall.realtime.bean.{PageDisplayLog, PageLog}
-import com.atguigu.gmall.realtime.util.MyKafkaUtils
+import com.atguigu.gmall.realtime.bean.{PageActionLog, PageDisplayLog, PageLog, StartLog}
+import com.atguigu.gmall.realtime.util.{MyKafkaUtils, MyOffsetsUtils}
 import org.apache.kafka.clients.consumer.ConsumerRecord
+import org.apache.kafka.common.TopicPartition
 import org.apache.spark.SparkConf
 import org.apache.spark.streaming.dstream.{DStream, InputDStream}
+import org.apache.spark.streaming.kafka010.{HasOffsetRanges, OffsetRange}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 
 /**
@@ -33,12 +35,36 @@ object OdsBaseLogApp {
     //2. 从kafka中消费数据
     val topicName : String = "ODS_BASE_LOG_1018"  //对应生成器配置中的主题名
     val groupId : String = "ODS_BASE_LOG_GROUP_1018"
-    val kafkaDStream: InputDStream[ConsumerRecord[String, String]] =
-                    MyKafkaUtils.getKafkaDStream(ssc, topicName , groupId)
+
+    //TODO  从Redis中读取offset， 指定offset进行消费
+    val offsets: Map[TopicPartition, Long] = MyOffsetsUtils.readOffset(topicName, groupId)
+
+    var kafkaDStream: InputDStream[ConsumerRecord[String, String]] = null
+    if(offsets != null && offsets.nonEmpty ){
+      //指定offset进行消费
+      kafkaDStream=
+        MyKafkaUtils.getKafkaDStream(ssc, topicName , groupId , offsets)
+
+    }else{
+      //默认offset进行消费
+      kafkaDStream=
+        MyKafkaUtils.getKafkaDStream(ssc, topicName , groupId )
+
+    }
+
+    // TODO 补充: 从当前消费到的数据中提取offsets , 不对流中的数据做任何处理.
+    var  offsetRanges: Array[OffsetRange] = null
+    val offsetRangesDStream: DStream[ConsumerRecord[String, String]] = kafkaDStream.transform(
+      rdd => {
+        offsetRanges = rdd.asInstanceOf[HasOffsetRanges].offsetRanges  // 在哪里执行? driver
+        rdd
+      }
+    )
+
     //kafkaDStream.print(100)
     //3. 处理数据
     //3.1 转换数据结构
-    val jsonObjDStream: DStream[JSONObject] = kafkaDStream.map(
+    val jsonObjDStream: DStream[JSONObject] = offsetRangesDStream.map(
       consumerRecord => {
         //获取ConsumerRecord中的value,value就是日志数据
         val log: String = consumerRecord.value()
@@ -62,13 +88,11 @@ object OdsBaseLogApp {
     //      公共字段
     //      启动数据
     //      错误数据
-
     val DWD_PAGE_LOG_TOPIC : String = "DWD_PAGE_LOG_TOPIC_1018"  // 页面访问
     val DWD_PAGE_DISPLAY_TOPIC : String = "DWD_PAGE_DISPLAY_TOPIC_1018" //页面曝光
     val DWD_PAGE_ACTION_TOPIC : String = "DWD_PAGE_ACTION_TOPIC_1018" //页面事件
     val DWD_START_LOG_TOPIC : String = "DWD_START_LOG_TOPIC_1018" // 启动数据
     val DWD_ERROR_LOG_TOPIC : String = "DWD_ERROR_LOG_TOPIC_1018" // 错误数据
-
     //分流规则:
     // 错误数据: 不做任何的拆分， 只要包含错误字段，直接整条数据发送到对应的topic
     // 页面数据: 拆分成页面访问， 曝光， 事件 分别发送到对应的topic
@@ -76,6 +100,7 @@ object OdsBaseLogApp {
 
     jsonObjDStream.foreachRDD(
       rdd => {
+
         rdd.foreach(
           jsonObj => {
             //分流过程
@@ -131,22 +156,56 @@ object OdsBaseLogApp {
                     //封装成PageDisplayLog
                     val pageDisplayLog =
                       PageDisplayLog(mid,uid,ar,ch,isNew,md,os,vc,ba,pageId,lastPageId,pageItem,pageItemType,duringTime,sourceType,displayType,displayItem,displayItemType,order,posId,ts)
-
                     // 写到 DWD_PAGE_DISPLAY_TOPIC
                     MyKafkaUtils.send(DWD_PAGE_DISPLAY_TOPIC , JSON.toJSONString(pageDisplayLog , new SerializeConfig(true)))
                   }
                 }
-
                 //提取事件数据（课下完成）
+                val actionJsonArr: JSONArray = jsonObj.getJSONArray("actions")
+                if(actionJsonArr != null && actionJsonArr.size() > 0 ){
+                  for(i <- 0 until actionJsonArr.size()){
+                    val actionObj: JSONObject = actionJsonArr.getJSONObject(i)
+                    //提取字段
+                    val actionId: String = actionObj.getString("action_id")
+                    val actionItem: String = actionObj.getString("item")
+                    val actionItemType: String = actionObj.getString("item_type")
+                    val actionTs: Long = actionObj.getLong("ts")
 
+                    //封装PageActionLog
+                    var pageActionLog =
+                        PageActionLog(mid,uid,ar,ch,isNew,md,os,vc,ba,pageId,lastPageId,pageItem,pageItemType,duringTime,sourceType,actionId,actionItem,actionItemType,actionTs,ts)
+                    //写出到DWD_PAGE_ACTION_TOPIC
+                    MyKafkaUtils.send(DWD_PAGE_ACTION_TOPIC , JSON.toJSONString(pageActionLog , new SerializeConfig(true)))
+                  }
+                }
               }
               // 启动数据（课下完成）
+              val startJsonObj: JSONObject = jsonObj.getJSONObject("start")
+              if(startJsonObj != null ){
+                //提取字段
+                val entry: String = startJsonObj.getString("entry")
+                val loadingTime: Long = startJsonObj.getLong("loading_time")
+                val openAdId: String = startJsonObj.getString("open_ad_id")
+                val openAdMs: Long = startJsonObj.getLong("open_ad_ms")
+                val openAdSkipMs: Long = startJsonObj.getLong("open_ad_skip_ms")
+
+                //封装StartLog
+                var startLog =
+                    StartLog(mid,uid,ar,ch,isNew,md,os,vc,ba,entry,openAdId,loadingTime,openAdMs,openAdSkipMs,ts)
+                //写出DWD_START_LOG_TOPIC
+                MyKafkaUtils.send(DWD_START_LOG_TOPIC , JSON.toJSONString(startLog ,new SerializeConfig(true)))
+
+              }
             }
+            //foreach里面:  提交offset??? A  executor执行, 每条数据执行一次.
           }
+
         )
+        //foreachRDD里面，forech外面: 提交offset??? B  Driver段执行，一批次执行一次（周期性）
+        MyOffsetsUtils.saveOffset(topicName,groupId,offsetRanges)
       }
     )
-
+    // foreachRDD外面:  提交offsets??? C  Driver执行，每次启动程序执行一次.
 
     ssc.start()
     ssc.awaitTermination()
