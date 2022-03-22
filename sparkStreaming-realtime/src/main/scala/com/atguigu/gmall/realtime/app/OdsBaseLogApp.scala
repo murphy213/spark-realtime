@@ -100,7 +100,6 @@ object OdsBaseLogApp {
 
     jsonObjDStream.foreachRDD(
       rdd => {
-
         rdd.foreachPartition(
           jsonObjIter => {
             for (jsonObj <- jsonObjIter) {
