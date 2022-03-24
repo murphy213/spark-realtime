@@ -1,14 +1,22 @@
 package com.atguigu.gmall.realtime.app
 
-import com.alibaba.fastjson.JSON
-import com.atguigu.gmall.realtime.bean.PageLog
-import com.atguigu.gmall.realtime.util.{MyKafkaUtils, MyOffsetsUtils}
+import java.text.SimpleDateFormat
+import java.time.{LocalDate, Period}
+import java.{lang, util}
+import java.util.Date
+
+import com.alibaba.fastjson.{JSON, JSONObject}
+import com.atguigu.gmall.realtime.bean.{DauInfo, PageLog}
+import com.atguigu.gmall.realtime.util.{MyBeanUtils, MyKafkaUtils, MyOffsetsUtils, MyRedisUtils}
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.TopicPartition
 import org.apache.spark.SparkConf
 import org.apache.spark.streaming.dstream.{DStream, InputDStream}
 import org.apache.spark.streaming.kafka010.{HasOffsetRanges, OffsetRange}
 import org.apache.spark.streaming.{Seconds, StreamingContext}
+import redis.clients.jedis.Jedis
+
+import scala.collection.mutable.ListBuffer
 
 /**
   * 日活宽表
@@ -81,12 +89,138 @@ object DwdDauApp {
 
     // 第三方审查:  通过redis将当日活跃的mid维护起来,自我审查后的每条数据需要到redis中进行比对去重
     // redis中如何维护日活状态
-    // 类型:
-    // key :
-    // value :
-    // 写入API:
-    // 读取API:
-    // 过期:
+    // 类型:    set
+    // key :    DAU:DATE
+    // value :  mid的集合
+    // 写入API: sadd
+    // 读取API: smembers
+    // 过期:  24小时
+
+    //filterDStream.filter()  // 每条数据执行一次. redis的连接太频繁.
+    // [A, B , C ] => [ AA ,BB ]
+    val redisFilterDStream: DStream[PageLog] = filterDStream.mapPartitions(
+      pageLogIter => {
+        val pageLogList: List[PageLog] = pageLogIter.toList
+        println("第三方审查前: " + pageLogList.size)
+
+        //存储要的数据
+        val pageLogs: ListBuffer[PageLog] = ListBuffer[PageLog]()
+        val sdf: SimpleDateFormat = new SimpleDateFormat("yyyy-MM-dd")
+        val jedis: Jedis = MyRedisUtils.getJedisFromPool()
+        for (pageLog <- pageLogList) {
+          // 提取每条数据中的mid (我们日活的统计基于mid， 也可以基于uid)
+          val mid: String = pageLog.mid
+
+          //获取日期 , 因为我们要测试不同天的数据，所以不能直接获取系统时间.
+          val ts: Long = pageLog.ts
+          val date: Date = new Date(ts)
+          val dateStr: String = sdf.format(date)
+          val redisDauKey: String = s"DAU:$dateStr"
+
+          //redis的判断是否包含操作
+          /*
+          下面代码在分布式环境中，存在并发问题， 可能多个并行度同时进入到if中,导致最终保留多条同一个mid的数据.
+          // list
+          val mids: util.List[String] = jedis.lrange(redisDauKey, 0 ,-1)
+          if(!mids.contains(mid)){
+            jedis.lpush(redisDauKey , mid )
+            pageLogs.append(pageLog)
+          }
+          // set
+          val setMids: util.Set[String] = jedis.smembers(redisDauKey)
+          if(!setMids.contains(mid)){
+            jedis.sadd(redisDauKey,mid)
+            pageLogs.append(pageLog)
+          }
+
+           */
+          val isNew: lang.Long = jedis.sadd(redisDauKey, mid) // 判断包含和写入实现了原子操作.
+          if (isNew == 1L) {
+            pageLogs.append(pageLog)
+          }
+        }
+        jedis.close()
+        println("第三方审查后: " + pageLogs.size)
+        pageLogs.iterator
+      }
+    )
+    //redisFilterDStream.print()
+
+    //5.3 维度关联
+    val dauInfoDStream: DStream[DauInfo] = redisFilterDStream.mapPartitions(
+      pageLogIter => {
+        val dauInfos: ListBuffer[DauInfo] = ListBuffer[DauInfo]()
+        val sdf: SimpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+        val jedis: Jedis = MyRedisUtils.getJedisFromPool()
+        for (pageLog <- pageLogIter) {
+          val dauInfo: DauInfo = new DauInfo()
+          //1. 将pagelog中以后的字段拷贝到DauInfo中
+          //笨办法: 将pageLog中的每个字段的值挨个提取，赋值给dauInfo中对应的字段。
+          //dauInfo.mid = pageLog.mid
+          //好办法: 通过对象拷贝来完成.
+          MyBeanUtils.copyProperties(pageLog, dauInfo)
+
+          //2. 补充维度
+          //2.1  用户信息维度
+          val uid: String = pageLog.user_id
+          val redisUidkey: String = s"DIM:USER_INFO:$uid"
+          val userInfoJson: String = jedis.get(redisUidkey)
+          val userInfoJsonObj: JSONObject = JSON.parseObject(userInfoJson)
+          //提取性别
+          val gender: String = userInfoJsonObj.getString("gender")
+          //提取生日
+          val birthday: String = userInfoJsonObj.getString("birthday") // 1976-03-22
+          //换算年龄
+          val birthdayLd: LocalDate = LocalDate.parse(birthday)
+          val nowLd: LocalDate = LocalDate.now()
+          val period: Period = Period.between(birthdayLd, nowLd)
+          val age: Int = period.getYears
+
+          //补充到对象中
+          dauInfo.user_gender = gender
+          dauInfo.user_age = age.toString
+
+          //2.2  地区信息维度
+          // redis中:
+          // 现在: DIM:BASE_PROVINCE:1
+          // 之前: DIM:BASE_PROVINCE:110000
+          val provinceID: String = dauInfo.province_id
+          val redisProvinceKey: String = s"DIM:BASE_PROVINCE:$provinceID"
+          val provinceJson: String = jedis.get(redisProvinceKey)
+          val provinceJsonObj: JSONObject = JSON.parseObject(provinceJson)
+          val provinceName: String = provinceJsonObj.getString("name")
+          val provinceIsoCode: String = provinceJsonObj.getString("iso_code")
+          val province3166: String = provinceJsonObj.getString("iso_3166_2")
+          val provinceAreaCode: String = provinceJsonObj.getString("area_code")
+
+          //补充到对象中
+          dauInfo.province_name = provinceName
+          dauInfo.province_iso_code = provinceIsoCode
+          dauInfo.province_3166_2 = province3166
+          dauInfo.province_area_code = provinceAreaCode
+
+          //2.3  日期字段处理
+          val date: Date = new Date(pageLog.ts)
+          val dtHr: String = sdf.format(date)
+          val dtHrArr: Array[String] = dtHr.split(" ")
+          val dt: String = dtHrArr(0)
+          val hr: String = dtHrArr(1).split(":")(0)
+          //补充到对象中
+          dauInfo.dt = dt
+          dauInfo.hr = hr
+
+          dauInfos.append(dauInfo)
+        }
+
+        jedis.close()
+        dauInfos.iterator
+      }
+    )
+    dauInfoDStream.print(100)
+
+    //写入到OLAP中
+
+
     ssc.start()
     ssc.awaitTermination()
 
