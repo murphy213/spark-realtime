@@ -1,9 +1,11 @@
 package com.atguigu.gmall.realtime.app
 
 import java.time.{LocalDate, Period}
+import java.util
 
+import com.alibaba.fastjson.serializer.SerializeConfig
 import com.alibaba.fastjson.{JSON, JSONObject}
-import com.atguigu.gmall.realtime.bean.{OrderDetail, OrderInfo}
+import com.atguigu.gmall.realtime.bean.{OrderDetail, OrderInfo, OrderWide}
 import com.atguigu.gmall.realtime.util.{MyKafkaUtils, MyOffsetsUtils, MyRedisUtils}
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.TopicPartition
@@ -195,13 +197,84 @@ object DwdOrderApp {
     val orderJoinDStream: DStream[(Long, (Option[OrderInfo], Option[OrderDetail]))] =
             orderInfoKVDStream.fullOuterJoin(orderDetailKVDStream)
 
+    val orderWideDStream: DStream[OrderWide] = orderJoinDStream.mapPartitions(
+      orderJoinIter => {
+        val jedis: Jedis = MyRedisUtils.getJedisFromPool()
+        val orderWides: ListBuffer[OrderWide] = ListBuffer[OrderWide]()
+        for ((key, (orderInfoOp, orderDetailOp)) <- orderJoinIter) {
+          //orderInfo有， orderDetail有
+          if (orderInfoOp.isDefined) {
+            //取出orderInfo
+            val orderInfo: OrderInfo = orderInfoOp.get
+            if (orderDetailOp.isDefined) {
+              //取出orderDetail
+              val orderDetail: OrderDetail = orderDetailOp.get
+              //组装成orderWide
+              val orderWide: OrderWide = new OrderWide(orderInfo, orderDetail)
+              //放入到结果集中
+              orderWides.append(orderWide)
+            }
+            //orderInfo有，orderDetail没有
 
+            //orderInfo写缓存
+            // 类型:  string
+            // key :   ORDERJOIN:ORDER_INFO:ID
+            // value :  json
+            // 写入API:  set
+            // 读取API:  get
+            // 是否过期: 24小时
+            val redisOrderInfoKey: String = s"ORDERJOIN:ORDER_INFO:${orderInfo.id}"
+            //jedis.set(redisOrderInfoKey , JSON.toJSONString(orderInfo , new SerializeConfig(true)))
+            //jedis.expire(redisOrderInfoKey , 24 * 3600)
+            jedis.setex(redisOrderInfoKey, 24 * 3600, JSON.toJSONString(orderInfo, new SerializeConfig(true)))
 
+            //orderInfo读缓存
+            val redisOrderDetailKey: String = s"ORDERJOIN:ORDER_DETAIL:${orderInfo.id}"
+            val orderDetails: util.Set[String] = jedis.smembers(redisOrderDetailKey)
+            if (orderDetails != null && orderDetails.size() > 0) {
+              import scala.collection.JavaConverters._
+              for (orderDetailJson <- orderDetails.asScala) {
+                val orderDetail: OrderDetail = JSON.parseObject(orderDetailJson, classOf[OrderDetail])
+                //组装成orderWide
+                val orderWide: OrderWide = new OrderWide(orderInfo, orderDetail)
+                //加入到结果集中
+                orderWides.append(orderWide)
+              }
+            }
 
-    //orderJoinDStream.print(1000)
+          } else {
+            //orderInfo没有， orderDetail有
+            val orderDetail: OrderDetail = orderDetailOp.get
+            //读缓存
+            val redisOrderInfoKey: String = s"ORDERJOIN:ORDER_INFO:${orderDetail.order_id}"
+            val orderInfoJson: String = jedis.get(redisOrderInfoKey)
+            if (orderInfoJson != null && orderInfoJson.size > 0) {
+              val orderInfo: OrderInfo = JSON.parseObject(orderInfoJson, classOf[OrderInfo])
+              //组装成orderWide
+              val orderWide: OrderWide = new OrderWide(orderInfo, orderDetail)
+              //加入到结果集中
+              orderWides.append(orderWide)
+            } else {
+              //写缓存
+              // 类型:   set
+              // key :   ORDERJOIN:ORDER_DETAIL:ORDER_ID
+              // value :  json, json ....
+              // 写入API: sadd
+              // 读取API: smembers
+              // 是否过期: 24小时
+              val redisOrderDetailKey: String = s"ORDERJOIN:ORDER_DETAIL:${orderDetail.order_id}"
+              jedis.sadd(redisOrderDetailKey, JSON.toJSONString(orderDetail, new SerializeConfig(true)))
+              jedis.expire(redisOrderDetailKey, 24 * 3600)
+            }
+          }
+        }
+        jedis.close()
+        orderWides.iterator
+      }
+    )
+    //orderWideDStream.print(1000)
 
-
-
+    //写入ES
 
     ssc.start()
     ssc.awaitTermination()
