@@ -7,7 +7,7 @@ import java.util.Date
 
 import com.alibaba.fastjson.{JSON, JSONObject}
 import com.atguigu.gmall.realtime.bean.{DauInfo, PageLog}
-import com.atguigu.gmall.realtime.util.{MyBeanUtils, MyKafkaUtils, MyOffsetsUtils, MyRedisUtils}
+import com.atguigu.gmall.realtime.util.{MyBeanUtils, MyEsUtils, MyKafkaUtils, MyOffsetsUtils, MyRedisUtils}
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.common.TopicPartition
 import org.apache.spark.SparkConf
@@ -216,14 +216,38 @@ object DwdDauApp {
         dauInfos.iterator
       }
     )
-    dauInfoDStream.print(100)
+    //dauInfoDStream.print(100)
 
     //写入到OLAP中
-
+    //按照天分割索引，通过索引模板控制mapping、settings、aliases等.
+    //准备ES工具类
+    dauInfoDStream.foreachRDD(
+      rdd => {
+        rdd.foreachPartition(
+          dauInfoIter => {
+            val docs: List[(String, DauInfo)] =
+              dauInfoIter.map( dauInfo=> (dauInfo.mid , dauInfo)).toList
+            if(docs.size >  0 ){
+              // 索引名
+              // 如果是真实的实时环境，直接获取当前日期即可.
+              // 因为我们是模拟数据，会生成不同天的数据.
+              // 从第一条数据中获取日期
+              val head: (String, DauInfo) = docs.head
+              val ts: Long = head._2.ts
+              val sdf: SimpleDateFormat = new SimpleDateFormat("yyyy-MM-dd")
+              val dateStr: String = sdf.format(new Date(ts))
+              val indexName : String = s"gmall_dau_info_1018_$dateStr"
+              //写入到ES中
+              MyEsUtils.bulkSave(indexName , docs)
+            }
+          }
+        )
+        //提交offset
+        MyOffsetsUtils.saveOffset(topicName, groupId , offsetRanges)
+      }
+    )
 
     ssc.start()
     ssc.awaitTermination()
-
-
   }
 }
