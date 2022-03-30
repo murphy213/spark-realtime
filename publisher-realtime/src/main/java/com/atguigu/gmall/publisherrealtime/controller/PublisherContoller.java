@@ -23,6 +23,21 @@ public class PublisherContoller {
     PublisherService publisherService ;
 
     /**
+     *
+     * 交易分析 - 明细
+     * http://bigdata.gmall.com/detailByItem?date=2021-02-02&itemName=小米手机&pageNo=1&pageSize=20
+     */
+    @GetMapping("detailByItem")
+    public Map<String, Object> detailByItem(@RequestParam("date") String date ,
+                                            @RequestParam("itemName") String itemName ,
+                                            @RequestParam(value ="pageNo" , required = false  , defaultValue = "1") Integer pageNo ,
+                                            @RequestParam(value = "pageSize" , required = false , defaultValue = "20") Integer pageSize){
+        Map<String, Object> results =  publisherService.doDetailByItem(date, itemName, pageNo, pageSize);
+        return results ;
+    }
+
+
+    /**
      * 交易分析 - 按照类别(年龄、性别)统计
      *
      * http://bigdata.gmall.com/statsByItem?itemName=小米手机&date=2021-02-02&t=age
@@ -30,15 +45,12 @@ public class PublisherContoller {
      */
     @GetMapping("statsByItem")
     public List<NameValue> statsByItem(
-                @RequestParam("itemName")String itemName ,
-                @RequestParam("date") String date ,
-                @RequestParam("t") String t){
+            @RequestParam("itemName")String itemName ,
+            @RequestParam("date") String date ,
+            @RequestParam("t") String t){
         List<NameValue>  results =  publisherService.doStatsByItem(itemName , date , t );
         return results;
     }
-
-
-
 
 
 
